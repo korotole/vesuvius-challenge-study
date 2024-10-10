@@ -1,0 +1,9 @@
+[submodule "libs/c-blosc2"]
+	path = libs/c-blosc2
+	url = https://github.com/Blosc/c-blosc2
+[submodule "libs/vesuvius"]
+	path = libs/vesuvius
+	url = https://github.com/ScrollPrize/vesuvius.git
+[submodule "libs/vesuvius-c"]
+	path = libs/vesuvius-c
+	url = https://github.com/ScrollPrize/vesuvius-c.git
