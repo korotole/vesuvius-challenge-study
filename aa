@@ -371,3 +371,103 @@ if __name__ == "__main__":
 #     cv2.imwrite(OUTPUT_PATH + filename2 + "-0.jpg", left2)
 
 #     return OUTPUT_PATH + filename1 + "-0.jpg", OUTPUT_PATH + filename2 + "-0.jpg"
+
+
+from PIL import Image
+import os
+import re
+import argparse
+import pathlib
+
+def main():
+    """
+    Parses command-line arguments and executes the image splitting function.
+    """
+    # Initialize the argument parser
+    parser = argparse.ArgumentParser(description="Split an image into N equal parts and save them.")
+    
+    # Add arguments
+    parser.add_argument("image_path", type=str, help="Path to the input image.")
+    parser.add_argument("n", type=int, help="Number of equal parts to split the image into.")
+    parser.add_argument("output_dir", type=str, help="Directory to save the split images.")
+    
+    # Parse the arguments
+    args = parser.parse_args()
+    
+    # Call the image splitting function
+    try:
+        split_image_recursively(args.image_path, args.n, args.output_dir)
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+def split_image_recursively(image_path, n, output_dir):
+    """
+    Recursively splits an image into N parts, splitting along the largest dimension,
+    and saves the parts in the specified output directory.
+
+    Parameters:
+        image_path (str): Path to the input image.
+        n (int): The number of parts to split the image into.
+        output_dir (str): Directory where the split images will be saved.
+
+    Raises:
+        ValueError: If the number of splits is not a power of 2 or n < 1.
+    """
+    # Validate that n is a power of 2
+    if n < 1 or (n & (n - 1)) != 0:
+        raise ValueError("The number of splits (N) must be a power of 2 and greater than 0.")
+    
+    # Ensure the output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    def recursive_split(img, current_n, prefix):
+        """Helper function to perform the recursive splitting."""
+        if current_n == 1:
+            # Save the current image part
+            output_path = os.path.join(output_dir, f"{prefix}.png")
+            img.save(output_path)
+            return
+
+        # Get dimensions and decide the splitting axis
+        width, height = img.size        
+        label1, label2 = '\0', '\0'
+        if width >= height:
+            split_axis = "vertical"
+            mid_point = width // 2
+            box1 = (0, 0, mid_point, height)  # Left part
+            box2 = (mid_point, 0, width, height)  # Right part
+            label1 = "00" # l
+            label2 = "01" # r
+        else:
+            split_axis = "horizontal"
+            mid_point = height // 2
+            box1 = (0, 0, width, mid_point)  # Top part
+            box2 = (0, mid_point, width, height)  # Bottom part
+            label1 = "10" # t
+            label2 = "11" # b
+
+        # Split the image
+        img1 = img.crop(box1)
+        img2 = img.crop(box2)
+
+        # Recursively split the resulting parts
+        recursive_split(img1, current_n // 2, f"{prefix}-{label1}")
+        recursive_split(img2, current_n // 2, f"{prefix}-{label2}")
+
+    # Open the image and start recursive splitting
+    img = Image.open(image_path)
+
+    recursive_split(img, n, pathlib.Path(image_path).stem )
+    print(f"Image successfully split into {n} parts and saved in '{output_dir}'.")
+
+    """
+            # List files in the given folder (non-recursive)
+        for file in os.listdir(folder_path):
+            if file.lower().endswith(tuple(allowed_extensions)):
+                image_paths.append(os.path.join(folder_path, file))
+    """
+
+
+if __name__ == "__main__":
+    main()
