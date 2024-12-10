@@ -1,0 +1,373 @@
+from collections import Counter
+
+import cupy as cp
+import cv2
+import numpy as np
+from cuml import PCA, KMeans
+from cuml.cluster import KMeans
+from PIL import Image
+
+from cuml.decomposition import IncrementalPCA
+
+
+def perform_PCA(vector_set, n_components=25, batch_size=10000):
+    """
+    Perform PCA using Incremental PCA to handle large datasets.
+    Args:
+        vector_set (cupy.ndarray): The input data matrix.
+        n_components (int): Number of principal components.
+        batch_size (int): Size of data chunks for incremental fitting.
+    Returns:
+        cupy.ndarray: The principal components.
+    """
+    n_samples = vector_set.shape[0]
+    ipca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
+
+    # Fit IncrementalPCA in batches
+    for start in range(0, n_samples, batch_size):
+        end = min(start + batch_size, n_samples)
+        ipca.partial_fit(vector_set[start:end])
+
+    # Get principal components
+    EVS = cp.array(ipca.components_)
+    return EVS
+
+
+# def find_vector_set(diff_image, new_size):
+#     if new_size[0] < 5 or new_size[1] < 5:
+#         raise ValueError("Image size is too small for 5x5 blocks.")
+
+#     # Use CuPy for GPU-accelerated operations
+#     diff_image_gpu = cp.array(diff_image)
+#     vector_set = cp.zeros((int(new_size[0] * new_size[1] / 25), 25), dtype=cp.float32)
+#     i = 0
+
+#     for j in range(0, new_size[0] - 4, 5):
+#         for k in range(0, new_size[1] - 4, 5):
+#             block = diff_image_gpu[j : j + 5, k : k + 5].ravel()
+#             if block.shape[0] == 25:
+#                 vector_set[i, :] = block
+#                 i += 1
+
+#     vector_set = vector_set[:i, :]
+#     mean_vec = cp.mean(vector_set, axis=0)
+#     vector_set -= mean_vec
+#     return vector_set, mean_vec
+
+
+def find_vector_set(diff_image, new_size, chunk_size=5000):
+    if new_size[0] < 5 or new_size[1] < 5:
+        raise ValueError("Image size is too small for 5x5 blocks.")
+
+    # Allocate GPU memory lazily and use chunks
+    diff_image_gpu = cp.array(diff_image)
+    total_blocks = (new_size[0] - 4) * (new_size[1] - 4) // 25
+    vector_set = cp.zeros((total_blocks, 25), dtype=cp.float32)
+
+    i = 0
+    block_count = 0
+    for j in range(0, new_size[0] - 4, 5):
+        for k in range(0, new_size[1] - 4, 5):
+            block = diff_image_gpu[j : j + 5, k : k + 5].ravel()
+            if block.shape[0] == 25:
+                vector_set[block_count, :] = block
+                block_count += 1
+                if block_count >= chunk_size:  # Save memory by processing chunks
+                    vector_set[i : i + chunk_size, :] = vector_set[:chunk_size]
+                    block_count = 0
+                    i += chunk_size
+
+    vector_set = vector_set[: i + block_count, :]
+    mean_vec = cp.mean(vector_set, axis=0)
+    vector_set -= mean_vec
+
+    return vector_set, mean_vec
+
+
+def find_FVS(EVS, diff_image, mean_vec, new_size, chunk_size=10000):
+    """
+    Optimized `find_FVS` to minimize memory usage by processing in chunks.
+    """
+    diff_image_gpu = cp.array(diff_image)
+    rows, cols = new_size[0] - 4, new_size[1] - 4
+    total_blocks = rows * cols
+    FVS = cp.zeros(
+        (total_blocks, EVS.shape[0]), dtype=cp.float32
+    )  # Pre-allocate memory
+
+    block_idx = 0
+    for start_row in range(2, rows + 2, chunk_size):
+        end_row = min(start_row + chunk_size, rows + 2)
+        feature_vector_set = []
+
+        # Generate blocks within the chunk
+        for i in range(start_row, end_row):
+            for j in range(2, cols + 2):
+                block = diff_image_gpu[i - 2 : i + 3, j - 2 : j + 3].ravel()
+                feature_vector_set.append(block)
+
+        # Convert chunk to GPU array and compute partial FVS
+        feature_vector_set_gpu = cp.array(feature_vector_set, dtype=cp.float32)
+        FVS_chunk = cp.dot(feature_vector_set_gpu, EVS.T) - mean_vec
+        FVS[block_idx : block_idx + FVS_chunk.shape[0], :] = FVS_chunk
+
+        # Update block index and free memory
+        block_idx += FVS_chunk.shape[0]
+        del feature_vector_set, feature_vector_set_gpu, FVS_chunk
+        cp._default_memory_pool.free_all_blocks()
+
+    return FVS
+
+
+def clustering(FVS, components, new_size):
+    """
+    Optimized `clustering` to minimize memory usage during and after KMeans.
+    """
+    kmeans = KMeans(n_clusters=components)
+    output = kmeans.fit_predict(FVS)  # Keeps the output on the GPU
+
+    # Compute cluster counts directly on the GPU
+    unique, counts = cp.unique(output, return_counts=True)
+    least_index = unique[
+        cp.argmin(counts)
+    ].item()  # Find the cluster with the fewest points
+
+    # Generate change map directly in sparse format
+    change_map_gpu = cp.zeros((new_size[0] - 4, new_size[1] - 4), dtype=cp.uint8)
+    change_map_gpu.ravel()[output == least_index] = 255
+
+    return least_index, change_map_gpu.get()  # Convert to CPU only for final output
+
+
+def find_PCAKmeans(imagepath1, imagepath2):
+    # Load and preprocess images
+    image1 = cv2.imread(imagepath1, cv2.IMREAD_GRAYSCALE).astype(np.float32)
+    image2 = cv2.imread(imagepath2, cv2.IMREAD_GRAYSCALE).astype(np.float32)
+
+    print("Images read")
+
+    if image1.shape != image2.shape:
+        raise ValueError("Input images must have the same dimensions.")
+
+    new_size = (image1.shape[0] // 5 * 5, image1.shape[1] // 5 * 5)
+    image1 = cv2.resize(image1, new_size)
+    image2 = cv2.resize(image2, new_size)
+
+    print("Images resized")
+
+    diff_image = abs(image1 - image2)
+    diff_image = (diff_image / diff_image.max() * 255).astype(np.uint8)
+
+    vector_set, mean_vec = find_vector_set(diff_image, new_size)
+
+    print("Vector set found")
+
+    # Perform PCA with optimized memory usage
+    EVS = perform_PCA(vector_set, n_components=25, batch_size=10000)
+
+    print("PCA done")
+
+    FVS = find_FVS(EVS, diff_image, mean_vec, new_size)
+    components = 3
+
+    print("FVS found")
+
+    least_index, change_map = clustering(FVS, components, new_size)
+
+    print("Clustering done")
+
+    kernel = np.array(
+        [
+            [0, 0, 1, 0, 0],
+            [0, 1, 1, 1, 0],
+            [1, 1, 1, 1, 1],
+            [0, 1, 1, 1, 0],
+            [0, 0, 1, 0, 0],
+        ],
+        dtype=np.uint8,
+    )
+    cleanChangeMap = cv2.erode(change_map, kernel)
+
+    Image.fromarray(change_map).save("changemap.jpg")
+    Image.fromarray(cleanChangeMap).save("cleanchangemap.jpg")
+
+    print("Images generated")
+
+
+# import gc
+# from collections import Counter
+# from pathlib import Path
+
+# import cv2
+# import git
+# import imageio.v2 as imageio
+# import numpy as np
+# from PIL import Image
+# from sklearn.cluster import KMeans
+# from sklearn.decomposition import PCA
+
+# repo = git.Repo(".", search_parent_directories=True)
+# OUTPUT_PATH = repo.working_tree_dir + "/out/"
+# # Disable the safety check (use with caution!)
+# Image.MAX_IMAGE_PIXELS = None
+# # Or, set a higher limit
+# # Image.MAX_IMAGE_PIXELS = 1000000000  # Example: Allow up to 1 billion pixels
+
+# def find_vector_set(diff_image, new_size):
+#     if new_size[0] < 5 or new_size[1] < 5:
+#         raise ValueError("Image size is too small for 5x5 blocks.")
+
+#     vector_set = np.zeros((int(new_size[0] * new_size[1] / 25), 25))
+#     i = 0
+
+#     for j in range(0, new_size[0] - 4, 5):  # Correct indexing
+#         for k in range(0, new_size[1] - 4, 5):
+#             block = diff_image[j : j + 5, k : k + 5]
+#             feature = block.ravel()
+#             if feature.shape[0] == 25:
+#                 vector_set[i, :] = feature
+#                 i += 1
+
+#     if i == 0:  # Check if no blocks were added
+#         raise ValueError("No valid 5x5 blocks found in the image.")
+
+#     vector_set = vector_set[:i, :]  # Trim unused rows
+#     mean_vec = np.mean(vector_set, axis=0)
+#     vector_set = vector_set - mean_vec
+
+#     return vector_set, mean_vec
+
+
+# def find_FVS(EVS, diff_image, mean_vec, new):
+#     i = 2
+#     feature_vector_set = []
+
+#     while i < new[0] - 2:
+#         j = 2
+#         while j < new[1] - 2:
+#             block = diff_image[i - 2 : i + 3, j - 2 : j + 3]
+#             feature = block.flatten()
+#             feature_vector_set.append(feature)
+#             j = j + 1
+#         i = i + 1
+
+#     FVS = np.dot(feature_vector_set, EVS)
+#     FVS = FVS - mean_vec
+#     print(f"\nFeature vector space size: {FVS.shape}")
+#     return FVS
+
+
+# def clustering(FVS, components, new):
+#     kmeans = KMeans(components, verbose=0)
+#     kmeans.fit(FVS)
+#     output = kmeans.predict(FVS)
+#     count = Counter(output)
+
+#     least_index = min(count, key=count.get)
+
+#     # Ensure reshape dimensions match the output size
+#     expected_size = (new[0] - 4) * (new[1] - 4)
+#     print(f"Output size: {output.size}, Expected size: {expected_size}")
+
+#     if output.size != expected_size:
+#         raise ValueError(
+#             f"Cannot reshape: Output size {output.size} does not match the expected size {expected_size}"
+#         )
+
+#     # Reshape output correctly
+#     change_map = np.reshape(output, (new[0] - 4, new[1] - 4))
+#     return least_index, change_map
+
+
+# def find_PCAKmeans(imagepath1, imagepath2):
+#     # Load images
+#     image1 = imageio.imread(imagepath1)
+#     image2 = imageio.imread(imagepath2)
+
+#     if image1.size == 0 or image2.size == 0:
+#         raise ValueError("One or both images are empty.")
+#     if image1.shape != image2.shape:
+#         raise ValueError("Input images must have the same dimensions.")
+
+#     # Resize images
+#     new_size = np.asarray(image1.shape) // 5  # Integer division for resizing
+#     new_size = new_size * 5  # Ensure size is a multiple of 5
+#     image1 = cv2.resize(image1, (new_size[1], new_size[0])).astype(np.int16)
+#     image2 = cv2.resize(image2, (new_size[1], new_size[0])).astype(np.int16)
+
+#     # Compute absolute difference
+#     diff_image = abs(image1 - image2)
+
+#     # Convert diff_image to 8-bit format and save it
+#     if diff_image.max() == 0:
+#         diff_image_8bit = np.zeros(diff_image.shape, dtype=np.uint8)
+#     else:
+#         diff_image_8bit = (diff_image / diff_image.max() * 255).astype(np.uint8)
+
+#     diff_image_pil = Image.fromarray(diff_image_8bit)
+#     diff_image_pil.save("diff.jpg")
+
+#     # PCA and K-means clustering
+#     vector_set, mean_vec = find_vector_set(diff_image, new_size)
+#     pca = PCA()
+#     pca.fit(vector_set)
+#     EVS = pca.components_
+
+#     FVS = find_FVS(EVS, diff_image, mean_vec, new_size)
+#     components = 3
+#     least_index, change_map = clustering(FVS, components, new_size)
+
+#     # Post-process change map
+#     change_map[change_map == least_index] = 255
+#     change_map[change_map != 255] = 0
+
+#     change_map = change_map.astype(np.uint8)
+#     kernel = np.asarray(
+#         (
+#             (0, 0, 1, 0, 0),
+#             (0, 1, 1, 1, 0),
+#             (1, 1, 1, 1, 1),
+#             (0, 1, 1, 1, 0),
+#             (0, 0, 1, 0, 0),
+#         ),
+#         dtype=np.uint8,
+#     )
+#     cleanChangeMap = cv2.erode(change_map, kernel)
+
+#     # Save maps as images
+#     Image.fromarray(change_map).save("changemap.jpg")
+#     Image.fromarray(cleanChangeMap).save("cleanchangemap.jpg")
+
+
+if __name__ == "__main__":
+    q = "/home/korotole/repos/vesuvius-challenge-study/out/00-0.jpg"
+    p = "/home/korotole/repos/vesuvius-challenge-study/out/01-0.jpg"
+    # fname1, fname2 = preprocess_images(q, p)
+    find_PCAKmeans(q, p)
+
+
+# def preprocess_images(path1, path2):
+#     filename1 = Path(path1).stem
+#     filename2 = Path(path2).stem
+
+#     img1 = cv2.imread(path1)
+#     img2 = cv2.imread(path1)
+
+#     if img1.shape != img2.shape:
+#         print("Error: images of different shape")
+
+#     h, w, _ = img1.shape
+#     half = w // 2
+
+#     left1 = img1[:, :half]
+#     right1 = img1[:, half:]
+
+#     left2 = img1[:, :half]
+#     right2 = img1[:, half:]
+
+#     cv2.imwrite(OUTPUT_PATH + filename1 + "-1.jpg", right1)
+#     cv2.imwrite(OUTPUT_PATH + filename1 + "-0.jpg", left1)
+#     cv2.imwrite(OUTPUT_PATH + filename2 + "-1.jpg", right2)
+#     cv2.imwrite(OUTPUT_PATH + filename2 + "-0.jpg", left2)
+
+#     return OUTPUT_PATH + filename1 + "-0.jpg", OUTPUT_PATH + filename2 + "-0.jpg"
